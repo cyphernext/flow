@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"flow/internal/flowdb"
+	"flow/internal/harness/claude"
 	"flow/internal/iterm"
 	"flow/internal/spawner"
 	"io"
@@ -14,6 +15,28 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+// stubPS replaces claude.PSRunner with a canned-output stub so the
+// live-session guard in cmdDo can be exercised without touching the
+// real process table. Replaces the legacy app-package `psRunner`
+// override the test suite used before the harness refactor.
+func stubPS(t *testing.T, output string) {
+	t.Helper()
+	old := claude.PSRunner
+	claude.PSRunner = func() ([]byte, error) {
+		return []byte(output), nil
+	}
+	t.Cleanup(func() { claude.PSRunner = old })
+}
+
+// stubNewUUID pins claude.NewUUID to a fixed value for the duration
+// of the test.
+func stubNewUUID(t *testing.T, sid string) {
+	t.Helper()
+	old := claude.NewUUID
+	claude.NewUUID = func() (string, error) { return sid, nil }
+	t.Cleanup(func() { claude.NewUUID = old })
+}
 
 // stubITerm replaces iterm.Runner with a counter + captured-script
 // recorder. Returns the counter pointer and a function that reads the
@@ -58,6 +81,43 @@ func seedTask(t *testing.T, slug string) {
 	if rc := cmdAdd([]string{"task", slug}); rc != 0 {
 		t.Fatalf("seed task rc=%d", rc)
 	}
+}
+
+// seedTaskAtCwd creates a task with work_dir set to the test process's
+// current cwd. Used by --here tests that want to satisfy the
+// cwd-mismatch invariant without contriving a chdir.
+func seedTaskAtCwd(t *testing.T, slug string) {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	if rc := cmdAdd([]string{"task", slug, "--work-dir", cwd}); rc != 0 {
+		t.Fatalf("seed task rc=%d", rc)
+	}
+}
+
+// stubClaudeStatOK makes claude.ValidateSession succeed for every
+// (workDir, sessionID) pair, for tests that don't materialize fake
+// jsonl files under a temp $HOME. Counterpart helper for the
+// negative case is stubClaudeStatMissing.
+func stubClaudeStatOK(t *testing.T) {
+	t.Helper()
+	old := claude.StatFn
+	claude.StatFn = func(string) error { return nil }
+	t.Cleanup(func() { claude.StatFn = old })
+}
+
+// stubClaudeStatMissing makes claude.ValidateSession refuse every
+// pair as "file not found." Models the chained-cd cheat and any
+// other case where the on-disk jsonl doesn't match work_dir.
+func stubClaudeStatMissing(t *testing.T) {
+	t.Helper()
+	old := claude.StatFn
+	claude.StatFn = func(p string) error {
+		return &os.PathError{Op: "stat", Path: p, Err: os.ErrNotExist}
+	}
+	t.Cleanup(func() { claude.StatFn = old })
 }
 
 // TestCmdDoLiveSessionGuard checks that a task whose session_id is in
@@ -244,9 +304,7 @@ func TestCmdDoFreshAllocatesSessionID(t *testing.T) {
 	_, getScript := stubITerm(t)
 
 	const pinnedSID = "11111111-2222-3333-4444-555555555555"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	if rc := cmdDo([]string{"fresh-task"}); rc != 0 {
 		t.Fatalf("rc=%d", rc)
@@ -297,9 +355,7 @@ func TestCmdDoFreshSpawnFailureRollsBackSessionID(t *testing.T) {
 	seedTask(t, "fail-task")
 
 	const pinnedSID = "ffffffff-aaaa-bbbb-cccc-dddddddddddd"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	// Stub iterm.Runner to fail every call — simulates the
 	// Accessibility-denied path on Terminal.app, but works equally
@@ -422,9 +478,7 @@ func TestCmdDoFreshRotatesStaleSession(t *testing.T) {
 	db.Close()
 
 	const pinnedSID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	_, getScript := stubITerm(t)
 	if rc := cmdDo([]string{"stale-task", "--fresh"}); rc != 0 {
@@ -734,7 +788,11 @@ func TestCmdDoPropagatesFlowRootEnv(t *testing.T) {
 // tasks.session_id without spawning anything.
 func TestCmdDoHereHappyPath(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "here-task")
+	seedTaskAtCwd(t, "here-task")
+	// Pretend the jsonl exists at work_dir's encoded path — that
+	// satisfies h.ValidateSession without touching the real
+	// filesystem.
+	stubClaudeStatOK(t)
 	const sid = "f00ba111-2222-4333-8444-555555555555"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
@@ -812,7 +870,10 @@ func TestCmdDoHereRejectsAlreadyBound(t *testing.T) {
 // the prior session.
 func TestCmdDoHereForceOverwritesBinding(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "force-task")
+	// Force-rebind still needs to satisfy the cwd-matches-work_dir
+	// invariant — the new session must have been started at work_dir.
+	seedTaskAtCwd(t, "force-task")
+	stubClaudeStatOK(t)
 
 	const oldSID = "deadbeef-1111-4222-8333-444455556666"
 	const newSID = "f00ba111-2222-4333-8444-555555555555"
@@ -841,7 +902,8 @@ func TestCmdDoHereForceOverwritesBinding(t *testing.T) {
 // no overwrite needed).
 func TestCmdDoHereIdempotent(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "idem-task")
+	seedTaskAtCwd(t, "idem-task")
+	stubClaudeStatOK(t)
 	const sid = "f00ba111-2222-4333-8444-555555555555"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
@@ -1113,5 +1175,87 @@ func TestCmdDoWithRejectedWithHere(t *testing.T) {
 	}
 	if atomic.LoadInt64(spawns) != 0 {
 		t.Errorf("--with + --here should not spawn: %d", *spawns)
+	}
+}
+
+// ---------- cwd-matches-work_dir invariant on flow do --here ----------
+
+// TestCmdDoHereRefusesWhenTranscriptMissing pins the GH #59
+// invariant: --here refuses when the harness's on-disk transcript
+// for (work_dir, sid) isn't where future resumes would look. This
+// is the honest check that catches both naive cwd mismatches AND
+// the chained-cd cheat — comparing os.Getwd() to work_dir would
+// be fooled by `cd <work_dir> && flow do --here task`; statting
+// the jsonl can't be.
+func TestCmdDoHereRefusesWhenTranscriptMissing(t *testing.T) {
+	setupFlowRoot(t)
+	// Even with work_dir == cwd, an absent jsonl must still
+	// refuse — i.e. the cheat doesn't work.
+	seedTaskAtCwd(t, "mismatch-task")
+	stubClaudeStatMissing(t)
+
+	const sid = "11111111-2222-4333-8444-555555555555"
+	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+	stderr := captureStderr(t)
+	rc := cmdDoHere("mismatch-task", false)
+	if rc != 1 {
+		t.Errorf("cmdDoHere with missing transcript rc=%d, want 1", rc)
+	}
+	got := stderr()
+	for _, want := range []string{
+		"transcript isn't where work_dir says",
+		"flow do mismatch-task",
+		"--work-dir",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stderr missing %q; got:\n%s", want, got)
+		}
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "mismatch-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Errorf("refused --here should not set session_id; got %+v", task.SessionID)
+	}
+	if task.Status != "backlog" {
+		t.Errorf("refused --here should not flip status; got %q", task.Status)
+	}
+}
+
+// TestCmdDoHereForceDoesNotBypassCwdGate pins that --force does NOT
+// override the cwd-mismatch invariant: --force overrides the
+// already-bound-elsewhere check but the cwd check must still hold,
+// because passing it would create a fresh invariant violation
+// (work_dir != cwd-of-session). The user fix is to cd or update
+// work_dir first.
+func TestCmdDoHereForceDoesNotBypassCwdGate(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "force-mismatch")
+	stubClaudeStatMissing(t)
+
+	const oldSID = "deadbeef-1111-4222-8333-444455556666"
+	const newSID = "f00ba111-2222-4333-8444-555555555555"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, status='in-progress' WHERE slug='force-mismatch'`,
+		oldSID, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", newSID)
+	if rc := cmdDoHere("force-mismatch", true); rc != 1 {
+		t.Errorf("cmdDoHere --force with cwd mismatch rc=%d, want 1", rc)
+	}
+
+	db = openFlowDB(t)
+	task, _ := flowdb.GetTask(db, "force-mismatch")
+	if task.SessionID.String != oldSID {
+		t.Errorf("session_id should be untouched; got %q want %s", task.SessionID.String, oldSID)
 	}
 }

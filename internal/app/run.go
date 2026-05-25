@@ -35,7 +35,7 @@ func cmdRunPlaybook(args []string) int {
 	}
 	slug := args[0]
 	fs := flagSet("run playbook")
-	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "pass --dangerously-skip-permissions through to claude (ignored when --here is set)")
+	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness (ignored when --here is set)")
 	here := fs.Bool("here", false, "bind THIS Claude session to the new playbook run (no new tab); requires running inside a Claude Code session")
 	withInstr := fs.String("with", "", "inject `<instruction>` as the run session's first user message (forwarded to flow do)")
 	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (forwarded to flow do)")
@@ -75,15 +75,18 @@ func cmdRunPlaybook(args []string) int {
 	// backlog playbook_run task when env is wrong or this session is
 	// already owned by another task.
 	if *here {
+		h := defaultHarness()
 		sid := currentSessionID()
 		if sid == "" {
-			fmt.Fprintln(os.Stderr,
-				"error: --here requires running inside a Claude Code session ($CLAUDE_CODE_SESSION_ID is unset)")
+			fmt.Fprintf(os.Stderr,
+				"error: --here requires running inside a Claude Code session ($%s is unset)\n",
+				h.SessionIDEnvVar())
 			return 1
 		}
-		if !sessionUUIDRe.MatchString(sid) {
+		if err := h.ValidateSessionID(sid); err != nil {
 			fmt.Fprintf(os.Stderr,
-				"error: $CLAUDE_CODE_SESSION_ID is not a valid v4 UUID (got %q)\n", sid)
+				"error: $%s is not a valid session id (%v)\n",
+				h.SessionIDEnvVar(), err)
 			return 1
 		}
 		priorBinding, lookupErr := flowdb.TaskBySessionID(db, sid)
@@ -114,6 +117,23 @@ func cmdRunPlaybook(args []string) int {
 		return 1
 	}
 
+	// Run task's work_dir. For the default (new-tab) path that's
+	// the playbook's work_dir — we spawn a tab there. For the
+	// --here path we adopt the binding session's cwd, because the
+	// run will execute in THIS session (wherever the user has it),
+	// and the cwd==work_dir invariant the bind path enforces means
+	// they must agree. If the user wants the run at the playbook's
+	// default path, they cd there first.
+	runWorkDir := pb.WorkDir
+	if *here {
+		wd, gerr := os.Getwd()
+		if gerr != nil {
+			fmt.Fprintf(os.Stderr, "error: read cwd: %v\n", gerr)
+			return 1
+		}
+		runWorkDir = wd
+	}
+
 	// Insert the run-task row.
 	now := flowdb.NowISO()
 	_, err = db.Exec(
@@ -123,7 +143,7 @@ func cmdRunPlaybook(args []string) int {
 		fmt.Sprintf("%s run %s", pb.Slug, runSlug),
 		pb.ProjectSlug,
 		pb.Slug,
-		pb.WorkDir,
+		runWorkDir,
 		now, now, now,
 	)
 	if err != nil {
@@ -148,7 +168,9 @@ func cmdRunPlaybook(args []string) int {
 
 	if *here {
 		// In-session bind path: no terminal spawn. dangerSkip is dropped
-		// — there's no claude process to forward the flag to.
+		// — there's no claude process to forward the flag to. Run task
+		// was inserted with work_dir = os.Getwd() above so cmdDoHere's
+		// cwd-matches-work_dir invariant check passes without --force.
 		return cmdDoHere(runSlug, false)
 	}
 
