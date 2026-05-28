@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-alpha.16] — 2026-05-28
+
+### Fixed
+
+- **Migration silently drops `tasks.harness` on older DBs.** The
+  session-invariant table rebuild in `migrateTasksSessionInvariant`
+  hardcoded `tasks_new`'s DDL and omitted the `harness` column added
+  one statement earlier in the same `runMigrations` pass. DBs
+  upgrading from a version that predated the rebuild (e.g.
+  `v0.1.0-alpha.4` → `v0.1.0-alpha.15`) had `harness` added by
+  `ALTER TABLE` and then silently dropped by the rebuild that
+  recreates `tasks` without listing it. Symptom: every subsequent
+  `SELECT` using `TaskCols` errored with `no such column: harness`,
+  making `flow list tasks` and most other commands unusable after
+  upgrading to alpha.15. Fix adds `harness TEXT` to `tasks_new`'s
+  DDL and to both column lists in `INSERT INTO tasks_new (...)
+  SELECT ... FROM tasks`. Users who already hit the bug recover
+  automatically on next upgrade: `columnExists` re-runs the
+  `ALTER`, and the rebuild's idempotency guard
+  (`strings.Contains(ddl, "session_id IS NOT NULL")`) short-circuits
+  because the broken table already carries the CHECK. No data loss
+  in either direction — `harness` is nullable with `NULL` = "claude"
+  back-compat.
+  ([#63](https://github.com/Facets-cloud/flow/pull/63) by
+  [@rr0hit](https://github.com/rr0hit))
+
 ## [0.1.0-alpha.15] — 2026-05-27
 
 ### Added
