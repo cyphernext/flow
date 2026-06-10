@@ -8,6 +8,7 @@ import (
 	"flow/internal/flowdb"
 	"flow/internal/harness"
 	"flow/internal/harness/claude"
+	"flow/internal/spawner"
 )
 
 // allHarnesses returns every implemented harness adapter. The slice
@@ -140,6 +141,11 @@ func defaultHarness() harness.Harness {
 // contains entries from harnesses that resolved AND whose probe
 // succeeded. Used by `flow list tasks` to render [live] markers
 // without scanning the same process table N times.
+//
+// Background agents (claude --bg) typically don't carry --session-id /
+// --resume in their argv, so the ps scan misses them. For harnesses that
+// support background sessions, their registry (claude agents --json) is
+// merged in too so bg-bound tasks still light up [live].
 func liveSessionsForTasks(tasks []*flowdb.Task) map[string]int {
 	seen := map[harness.Name]bool{}
 	merged := map[string]int{}
@@ -159,6 +165,60 @@ func liveSessionsForTasks(tasks []*flowdb.Task) map[string]int {
 				merged[id] += n
 			}
 		}
+		// Only consult the background-agent registry in bg mode. The query
+		// is a `claude agents` subprocess; firing it on every `flow list`
+		// for non-bg users would be a latency regression (and they have no
+		// bg sessions to surface). bg-mode invocations opt into the cost.
+		if spawner.IsBackground() {
+			if bg, ok := h.(harness.BackgroundLauncher); ok {
+				if agents, err := bg.BackgroundAgents(); err == nil {
+					for _, a := range agents {
+						// Only a running process counts as "live". --all
+						// surfaces exited/failed/done sessions too (pid 0);
+						// those are recoverable but not currently running, so
+						// they must not light up the [live] marker.
+						if a.SessionID != "" && a.PID > 0 {
+							merged[strings.ToLower(a.SessionID)]++
+						}
+					}
+				}
+			}
+		}
 	}
 	return merged
+}
+
+// bgAgentStatus returns the live background-agent entry for a task's bound
+// session, or nil if the task isn't bg-bound, has no session, the harness
+// can't host background agents, or the session isn't currently running.
+// Used by `flow show` to surface a bg session's status/state/pid via a
+// per-render `claude agents --json` lookup.
+func bgAgentStatus(t *flowdb.Task) *harness.BackgroundAgent {
+	if t == nil || !t.SessionID.Valid || t.SessionID.String == "" {
+		return nil
+	}
+	// Only consult the registry in bg mode — see liveSessionsForTasks.
+	// Keeps `flow show` free of a `claude agents` subprocess for non-bg
+	// users (and avoids surfacing bg state they never opted into).
+	if !spawner.IsBackground() {
+		return nil
+	}
+	h, err := harnessForTask(t)
+	if err != nil {
+		return nil
+	}
+	bg, ok := h.(harness.BackgroundLauncher)
+	if !ok {
+		return nil
+	}
+	agents, err := bg.BackgroundAgents()
+	if err != nil {
+		return nil
+	}
+	for i := range agents {
+		if strings.EqualFold(agents[i].SessionID, t.SessionID.String) {
+			return &agents[i]
+		}
+	}
+	return nil
 }

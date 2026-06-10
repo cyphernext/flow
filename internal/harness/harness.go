@@ -54,6 +54,66 @@ type LaunchOpts struct {
 	Inject string
 }
 
+// BackgroundAgent is one entry from a harness's background-agent
+// registry. For the claude adapter it is populated from
+// `claude agents --json`. SessionID is the full session id flow records
+// on the task; ShortID is the harness's display/handle id (claude: the
+// 8-char prefix of SessionID, shown in the Agent View and accepted by
+// `claude attach`/`logs`/`stop`).
+type BackgroundAgent struct {
+	ShortID   string
+	SessionID string
+	Name      string
+	Cwd       string
+	PID       int
+	Status    string // coarse liveness, e.g. "busy" / "idle"
+	State     string // finer state, e.g. "working" / "blocked" / "done"
+}
+
+// BackgroundLauncher is an OPTIONAL harness capability: hosting
+// terminal-free background sessions (claude's Agent View, via
+// `claude --bg`). flow selects this path when spawner.IsBackground() is
+// true ($FLOW_TERM=bg). A harness that does NOT implement it makes
+// `$FLOW_TERM=bg flow do <task>` fail cleanly — flow never silently
+// falls back to a terminal tab.
+//
+// Unlike the interactive path, flow does NOT pre-allocate the session id
+// here: a backgrounding harness mints (and manages) its own id. flow
+// captures the REAL id after spawn by querying the registry, so the
+// DB-authoritative binding contract holds without fighting the harness.
+type BackgroundLauncher interface {
+	// SpawnBackground starts a fresh background session in workDir,
+	// running prompt, displayed as name. workDir is where the agent
+	// begins (and what its transcript/CLAUDE.md context is keyed to) —
+	// it must be the task's work_dir, not the cwd flow happened to run
+	// from. It blocks only until the session is registered (no polling),
+	// then resolves and returns the full session id (plus current
+	// status) by querying the agent registry. The returned
+	// BackgroundAgent.SessionID is what flow records on the task.
+	SpawnBackground(workDir, name, prompt string, opts LaunchOpts) (BackgroundAgent, error)
+
+	// ResumeBackground brings a no-longer-tracked background session's
+	// conversation back as a fresh background agent, seeded from the
+	// prior session's transcript. NOTE: a backgrounding harness manages
+	// its own id, so this MINTS A NEW session id (the prior history is
+	// inherited, but `claude --bg --resume <id>` does not preserve the
+	// id — verified against the CLI and documented behavior). The
+	// returned BackgroundAgent carries the NEW id, which flow re-records
+	// on the task. workDir is where the resumed agent begins (the task's
+	// work_dir). opts.Inject, if set, is delivered as the first message
+	// after resume.
+	ResumeBackground(workDir, sessionID string, opts LaunchOpts) (BackgroundAgent, error)
+
+	// BackgroundAgents returns the current background-agent registry
+	// (claude: `claude agents --json --all`, so exited / failed /
+	// completed sessions are included, not just live ones). Used to
+	// decide spawn-vs-attach-vs-resume and to surface status in
+	// `flow show` / `flow list`. A registry entry with a zero PID is
+	// not currently running (its process exited) but is still
+	// recoverable by attaching in the Agent View.
+	BackgroundAgents() ([]BackgroundAgent, error)
+}
+
 // Harness is the contract every agent-CLI adapter implements.
 type Harness interface {
 	// Identity ---------------------------------------------------------
